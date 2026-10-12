@@ -72,7 +72,7 @@ DEFAULT_TEMPLATE = (
 )
 DEFAULT_BOT = "@SKYTUNNELbot"
 # کانال اعلان فروش از env (NOTIFIER_CHANNEL) یا پنل وب؛ اگه از پنل ثبت بشه، همون جایگزین می‌شه
-DEFAULT_CHANNEL = os.getenv("NOTIFIER_CHANNEL", "").strip()
+DEFAULT_CHANNEL = os.getenv("NOTIFIER_CHANNEL", "").strip()   # چندتا کانال: با ویرگول یا فاصله جدا کن
 TEMPLATE_FIELDS = ("gb", "type", "days", "price", "time", "date", "user", "bot")
 
 # نام نوع سرویس در اعلان (از پنل قابل تغییره: sale_notify_type_<type>)
@@ -356,6 +356,19 @@ def parse_channel(raw):
     return s.split("/")[-1].lstrip("@") or None
 
 
+MAX_CHANNELS = 10
+
+
+def split_channels(raw):
+    """چند کانال (هر خط/ویرگول/فاصله یه کانال) → لیست بدون تکراری، به ترتیب."""
+    out = []
+    for part in re.split(r"[\s,;،]+", str(raw or "")):
+        part = part.strip()
+        if part and part not in out:
+            out.append(part)
+    return out[:MAX_CHANNELS]
+
+
 class Notifier:
     def __init__(self):
         self.client = None
@@ -364,6 +377,7 @@ class Notifier:
         self.fail_count = {}            # order_id -> تعداد شکست
         self.last_heartbeat = 0.0
         self.last_status = None
+        self.hold_until = 0.0            # تا این لحظه نتیجه‌ی تست تو پنل می‌مونه
 
     # ---- لاگین ----
     async def login(self, phone):
@@ -400,6 +414,18 @@ class Notifier:
         self.entities[channel] = ent
         return ent
 
+    async def send_all(self, channels, text_html, settings):
+        """به همه‌ی کانال‌ها می‌فرسته؛ (لیست موفق‌ها، دیکشنری خطاها) برمی‌گردونه."""
+        ok, failed = [], {}
+        for ch in channels:
+            try:
+                await self.send(ch, text_html, settings)
+                ok.append(ch)
+            except Exception as e:
+                print(f"[send] کانال {ch} ناموفق:", repr(e))
+                failed[ch] = repr(e)[:150]
+        return ok, failed
+
     async def send(self, channel, text_html, settings):
         ent = await self.get_entity(channel)
         try:
@@ -427,20 +453,25 @@ class Notifier:
     async def tick(self):
         s = await asyncio.to_thread(get_all_settings)
         enabled = s.get("sale_notify_enabled", "1") == "1"
-        channel = (s.get("sale_notify_channel") or DEFAULT_CHANNEL or "").strip()
+        channels = split_channels(s.get("sale_notify_channel") or DEFAULT_CHANNEL)
 
         # درخواست تست از پنل
         req = s.get("sale_notify_test_req")
+        test_ran = False
         if req and req != s.get("sale_notify_test_done"):
+            test_ran = True
+            self.hold_until = time.time() + 60
             await asyncio.to_thread(set_setting, "sale_notify_test_done", req)
-            if not channel:
+            if not channels:
                 await self.report(False, "برای تست، اول کانال رو تو پنل ذخیره کن.", force=True)
             else:
-                try:
-                    await self.send(channel, "🧪 تست اعلان فروش\n\n" + build_message(s, SAMPLE_ORDER, True), s)
-                    await self.report(True, "پیام تست با موفقیت ارسال شد.", force=True)
-                except Exception as e:
-                    await self.report(False, f"ارسال تست ناموفق بود: {e!r}", force=True)
+                ok, failed = await self.send_all(
+                    channels, "🧪 تست اعلان فروش\n\n" + build_message(s, SAMPLE_ORDER, True), s)
+                if failed:
+                    bad = " | ".join(f"{c}: {m}" for c, m in failed.items())
+                    await self.report(False, f"تست به {len(ok)} از {len(channels)} کانال رسید. ناموفق: {bad}", force=True)
+                else:
+                    await self.report(True, f"پیام تست به {len(ok)} کانال ارسال شد.", force=True)
 
         # آخرین سفارشِ دیده‌شده؛ بار اول از «الان» شروع می‌کنیم تا خریدهای قدیمی اسپم نشن
         last_raw = s.get("sale_notify_last_id")
@@ -452,27 +483,34 @@ class Notifier:
 
         orders = await asyncio.to_thread(new_orders, last_id)
         if not orders:
-            await self.report(True, "فعال و در حال پایش سفارش‌ها" if enabled else "خاموش (از پنل)")
+            if not test_ran and time.time() >= self.hold_until:     # نتیجه‌ی تست یک دقیقه تو پنل می‌مونه
+                await self.report(True, "فعال و در حال پایش سفارش‌ها" if enabled else "خاموش (از پنل)")
             return
 
         for order in orders:
             oid, price = order[0], order[5]
             # خاموش یا بدون کانال یا رایگان: فقط جلو می‌ریم تا بعداً یهو اعلان نشه
-            if not enabled or not channel or not price or int(price) <= 0:
+            if not enabled or not channels or not price or int(price) <= 0:
                 last_id = oid
                 await asyncio.to_thread(set_setting, "sale_notify_last_id", last_id)
                 continue
-            try:
-                await self.send(channel, build_message(s, order, True), s)
+            ok, failed = await self.send_all(channels, build_message(s, order, True), s)
+            if ok:
+                # حداقل یه کانال رسید؛ جلو می‌ریم تا تو کانال‌های موفق پیام تکراری نره
                 self.fail_count.pop(oid, None)
                 last_id = oid
                 await asyncio.to_thread(set_setting, "sale_notify_last_id", last_id)
-                await self.report(True, f"آخرین اعلان: سفارش #{oid}", force=True)
-            except Exception as e:
+                if failed:
+                    bad = " | ".join(f"{c}: {m}" for c, m in failed.items())
+                    await self.report(False, f"سفارش #{oid} به {len(ok)} از {len(channels)} کانال رسید. ناموفق: {bad}", force=True)
+                else:
+                    await self.report(True, f"آخرین اعلان: سفارش #{oid} (به {len(ok)} کانال)", force=True)
+            else:
                 n = self.fail_count.get(oid, 0) + 1
                 self.fail_count[oid] = n
-                print(f"[send] سفارش {oid} ناموفق ({n}/{MAX_SEND_RETRIES}):", repr(e))
-                await self.report(False, f"ارسال سفارش #{oid} ناموفق بود: {e!r}", force=True)
+                bad = " | ".join(f"{c}: {m}" for c, m in failed.items())
+                print(f"[send] سفارش {oid} به هیچ کانالی نرسید ({n}/{MAX_SEND_RETRIES})")
+                await self.report(False, f"ارسال سفارش #{oid} ناموفق بود: {bad}", force=True)
                 if n >= MAX_SEND_RETRIES:
                     last_id = oid          # رد می‌شه تا سفارش‌های بعدی گیر نکنن
                     self.fail_count.pop(oid, None)
